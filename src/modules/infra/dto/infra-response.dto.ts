@@ -71,7 +71,12 @@ export class InfraStorageStatusDto {
   @ApiProperty({ enum: ['local', 's3'], example: 'local' })
   type!: string;
 
-  @ApiPropertyOptional({ description: 'Local storage root. Present only for `local`.', example: './data/storage' })
+  @ApiPropertyOptional({
+    description:
+      'Local storage root. Also reported for `s3`, where it is the fallback directory used while the bucket ' +
+      'is unreachable.',
+    example: './data/media',
+  })
   path?: string;
 
   @ApiPropertyOptional({ description: 'Bucket name. Present only for `s3`.', example: 'openwa-media' })
@@ -101,8 +106,9 @@ export class InfraEngineStatusDto {
     type: String,
     nullable: true,
     description:
-      'whatsapp-web.js only: the WhatsApp Web build actually in use, which is distinct from the ' +
-      'library version. Omitted for other engines.',
+      'whatsapp-web.js only: the WhatsApp Web build sessions request as their pin, which is distinct from the ' +
+      'library version. A page can still run another build; each session logs the one it runs when it reaches ' +
+      'ready. Omitted for other engines.',
     example: '2.3000.1234567890',
   })
   webVersion?: string | null;
@@ -134,7 +140,7 @@ export class InfraStatusResponseDto {
   @ApiProperty({
     type: [String],
     description:
-      'Which of the four settings the dashboard can edit are supplied by a layer ABOVE ' +
+      'Which dashboard-editable settings are supplied by a layer ABOVE ' +
       '`data/.env.generated` — the container environment or a project `.env` — and so cannot be ' +
       'changed from the dashboard until that layer is. Reported, not inferred from a running-vs-saved ' +
       'mismatch: a save that has not been restarted yet looks identical and needs the opposite advice.',
@@ -183,7 +189,8 @@ export class AvailableEngineDto {
 
   @ApiPropertyOptional({
     type: EngineLibraryDto,
-    description: 'Absent when the plugin does not report a library, which includes any disabled engine.',
+    description:
+      'Absent when the plugin does not report a library. Built-in engines report it whether or not they are enabled.',
   })
   library?: EngineLibraryDto;
 }
@@ -191,6 +198,34 @@ export class AvailableEngineDto {
 export class InfraCurrentEngineResponseDto {
   @ApiProperty({ description: 'Engine the process resolved at boot.', example: 'baileys' })
   engineType!: string;
+}
+
+// ---------- GET /infra/update-check ----------
+
+export class InfraUpdateCheckResponseDto {
+  @ApiProperty({ description: 'Version of the running code.', example: '0.23.5' })
+  current!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Latest published release, or null when the check is off or GitHub has not been reached yet. A ' +
+      'later failed check keeps the last known release.',
+    example: '0.23.6',
+  })
+  latest!: string | null;
+
+  @ApiProperty({ description: 'Whether `latest` is newer than `current`.', example: true })
+  updateAvailable!: boolean;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Release notes page for `latest`.',
+    example: 'https://github.com/rmyndharis/OpenWA/releases/tag/v0.23.6',
+  })
+  releaseUrl!: string | null;
 }
 
 // ---------- GET /infra/config ----------
@@ -461,13 +496,25 @@ export class InfraImportDataResponseDto {
   @ApiProperty({ type: TableCountsDto, description: 'Rows written per table.' })
   counts!: TableCountsDto;
 
-  @ApiProperty({ type: [String], description: 'Problems that did not stop the import.', example: [] })
+  @ApiProperty({
+    type: [String],
+    description:
+      'Why the restore was rolled back (per-row failures, or a backup with no rows). Non-empty only when ' +
+      '`imported` is false; non-fatal messages are in `notices`.',
+    example: [],
+  })
   warnings!: string[];
 
   @ApiProperty({ type: [String], description: 'Informational messages about what the import did.', example: [] })
   notices!: string[];
 
-  @ApiProperty({ description: 'Whether the process must restart before the imported state is live.', example: true })
+  @ApiProperty({
+    description:
+      'True when an engine may still be writing into the restored tables (orphans left running by `force`, a ' +
+      'failed `stopOrphans` teardown, sessions held by another node, or plugin bindings not re-applied). Restart ' +
+      'to reconcile. Can be true even when `imported` is false.',
+    example: false,
+  })
   restartRequired!: boolean;
 
   @ApiProperty({
@@ -501,10 +548,15 @@ export class StorageFileCountResponseDto {
 }
 
 export class StorageExportResponseDto {
-  @ApiProperty({ example: 'Storage archive created.' })
+  @ApiProperty({ example: 'Storage export completed' })
   message!: string;
 
-  @ApiProperty({ description: 'Path to download the archive from.', example: '/api/infra/storage/download/xyz.tar' })
+  @ApiProperty({
+    description:
+      'Server-side path of the archive, relative to the gateway working directory. Not a download URL: ' +
+      'pass it as `filePath` to POST /api/infra/storage/import.',
+    example: 'data/exports/storage-export-1750000000000-abc.tar.gz',
+  })
   download!: string;
 }
 
@@ -514,6 +566,13 @@ export class StorageImportResponseDto {
 
   @ApiProperty({ description: 'Objects written.', example: 128 })
   count!: number;
+
+  @ApiProperty({
+    description:
+      'Archive entries the store refused to write. `imported` is false when entries failed and none was written.',
+    example: 0,
+  })
+  failed!: number;
 
   @ApiProperty({ enum: ['local', 's3'], example: 'local' })
   storageType!: string;

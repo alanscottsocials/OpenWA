@@ -85,6 +85,11 @@ func (s *MessagesService) Reply(ctx context.Context, sessionID string, body Repl
 	return s.send(ctx, sessionID, "reply", body)
 }
 
+// ClickButton taps a choice on a WhatsApp Business prompt. Baileys only (whatsapp-web.js returns 501).
+func (s *MessagesService) ClickButton(ctx context.Context, sessionID string, body ClickButtonRequest) (*MessageResponse, error) {
+	return s.send(ctx, sessionID, "click-button", body)
+}
+
 // Forward forwards a message between chats.
 func (s *MessagesService) Forward(ctx context.Context, sessionID string, body ForwardMessageRequest) (*MessageResponse, error) {
 	return s.send(ctx, sessionID, "forward", body)
@@ -179,7 +184,7 @@ func (s *MessagesService) Unpin(ctx context.Context, sessionID string, body Unpi
 // size-only marker, or a URL-based send whose bytes were never stored).
 func (s *MessagesService) Media(ctx context.Context, sessionID, chatID, messageID string) (*MessageMedia, error) {
 	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/media"
-	data, contentType, err := s.client.doRaw(ctx, "GET", path, nil, nil)
+	data, contentType, err := s.client.doRaw(ctx, "GET", path, nil, nil, false)
 	if err != nil {
 		return nil, err
 	}

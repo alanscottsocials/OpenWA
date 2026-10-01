@@ -3,9 +3,10 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
 import { contactApi, sessionApi } from '../../services/api';
-import { useCurrentEngineQuery } from '../../hooks/queries';
+import { useRole } from '../../hooks/useRole';
 import { useToast } from '../../hooks/useToast';
 import { Modal } from '../Modal';
+import { MEDIA_UPLOAD_MAX_BYTES } from './ChatComposer';
 
 // Mirrors @ArrayMaxSize(256) on the send-status DTOs — the picker caps selection client-side so the
 // user can't build a list the backend is guaranteed to reject.
@@ -20,12 +21,13 @@ interface Props {
 function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
   const { t } = useTranslation();
   const { success: showSuccessToast, error: showErrorToast } = useToast();
-  const currentEngine = useCurrentEngineQuery();
+  // From the sign-in validate response: GET /infra/engines/current is admin-only, and operators post too.
+  const { engineType } = useRole();
 
   // Baileys targets a status post to an explicit allow-list (statusJidList); whatsapp-web.js has no
   // per-recipient concept and broadcasts to the account's status-privacy audience instead, so the
   // recipient picker is Baileys-only.
-  const isBaileysEngine = currentEngine.data?.engineType === 'baileys';
+  const isBaileysEngine = engineType === 'baileys';
 
   const [composeType, setComposeType] = useState<'text' | 'image'>('text');
   const [composeText, setComposeText] = useState<string>('');
@@ -102,6 +104,13 @@ function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
   const handleComposeImageFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // Posted as base64 JSON, so an oversized image would only be refused after the whole inflated
+    // body went up. Rejected before anything is cleared, so an image URL or earlier pick is kept.
+    if (file.size > MEDIA_UPLOAD_MAX_BYTES) {
+      showErrorToast(t('chats.errors.fileTooLarge'));
+      e.target.value = '';
+      return;
+    }
     setComposeImageUrl('');
     const myRead = ++composeImageReadSeq.current;
     const reader = new FileReader();
@@ -120,7 +129,7 @@ function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
     !composePosting &&
     // The engine type decides whether recipients are required (Baileys) or omitted (wwjs) — while
     // it's still unknown, a Baileys submit would go out with no recipients and 400.
-    Boolean(currentEngine.data) &&
+    Boolean(engineType) &&
     (composeType === 'text' ? composeText.trim().length > 0 : Boolean(composeImageBase64 || composeImageUrl.trim())) &&
     (!isBaileysEngine || composeRecipients.length > 0);
 

@@ -19,6 +19,7 @@ import com.rmyndharis.openwa.model.PinMessageRequest;
 import com.rmyndharis.openwa.model.ReactMessageRequest;
 import com.rmyndharis.openwa.model.ReactionRecord;
 import com.rmyndharis.openwa.model.ReplyMessageRequest;
+import com.rmyndharis.openwa.model.ClickButtonRequest;
 import com.rmyndharis.openwa.model.SendBulkRequest;
 import com.rmyndharis.openwa.model.SendContactRequest;
 import com.rmyndharis.openwa.model.SendLocationRequest;
@@ -80,7 +81,11 @@ public final class MessagesResource {
         return sendMedia(sessionId, "send-audio", body);
     }
 
-    /** Send a document (url or base64; {@code filename} required). */
+    /**
+     * Send a document (url or base64). {@code filename} is optional and is the name the recipient
+     * sees; without it the gateway uses {@code "file"}, or the URL basename for a URL send on
+     * whatsapp-web.js.
+     */
     public MessageResponse sendDocument(String sessionId, SendMediaRequest body) {
         return sendMedia(sessionId, "send-document", body);
     }
@@ -135,6 +140,19 @@ public final class MessagesResource {
         return client.request(
             HttpMethod.POST,
             "/api/sessions/" + encodeSegment(sessionId) + "/messages/reply",
+            null,
+            body,
+            MessageResponse.class);
+    }
+
+    /**
+     * Click a button on a WhatsApp Business prompt. Baileys only: whatsapp-web.js returns 501.
+     * Sends a structured reply proto quoted to the prompt, not a native UI tap.
+     */
+    public MessageResponse clickButton(String sessionId, ClickButtonRequest body) {
+        return client.request(
+            HttpMethod.POST,
+            "/api/sessions/" + encodeSegment(sessionId) + "/messages/click-button",
             null,
             body,
             MessageResponse.class);

@@ -4,6 +4,7 @@ import { Download, Search, Filter, Loader2, FileText, AlertCircle } from 'lucide
 import type { AuditLog } from '../services/api';
 import { auditApi } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useToast } from '../hooks/useToast';
 import { useLogsQuery } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { CustomSelect } from '../components/CustomSelect';
@@ -13,7 +14,8 @@ import { escapeCsvCell } from '../utils/csv';
 import './Logs.css';
 
 export function Logs() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const toast = useToast();
   useDocumentTitle(t('logs.title'));
   const [searchQuery, setSearchQuery] = useState('');
   const [severityFilter, setSeverityFilter] = useState('all');
@@ -88,36 +90,42 @@ export function Logs() {
 
   // Export the WHOLE audit history (honouring the active severity filter + search), not just the
   // current page — paginate through the API up to a safety cap so a huge table can't OOM the tab. On
-  // a fetch error, fall back to exporting the rows already on screen.
+  // a fetch error, report it and download nothing: the rows on screen would pass for the full export.
   const handleExportCsv = async () => {
     if (exporting) return;
     setExporting(true);
     try {
-      const all = await fetchAllPages<AuditLog>((limit, offset) =>
+      const { items, truncated, throttled } = await fetchAllPages<AuditLog>((limit, offset) =>
         auditApi.list({ severity: severityParam, limit, offset }),
       );
+      // The walk pages by offset over a live table, newest first: a row written between two pages pushes
+      // the older ones down, so the next page starts with one already fetched. Keep each id once.
+      const all = [...new Map(items.map(log => [log.id, log])).values()];
       const q = searchQuery.toLowerCase();
       const rows = q
         ? all.filter(l => l.action.toLowerCase().includes(q) || (l.errorMessage || '').toLowerCase().includes(q))
         : all;
-      if (rows.length > 0) download(buildCsv(rows));
-    } catch {
-      if (filteredLogs.length > 0) download(buildCsv(filteredLogs)); // graceful fallback to the page
+      // Either stop keeps the newest rows (the API orders newest first); older ones are missing. A
+      // narrower filter gets past the cap, only waiting gets past the throttle. The count follows the UI
+      // language, not the browser's locale, so it reads right inside the sentence.
+      const rowCount = all.length.toLocaleString(i18n.resolvedLanguage);
+      if (rows.length === 0) {
+        // After a truncated walk the older rows were never searched, so the message must not read as
+        // a verdict on the whole history.
+        if (truncated) toast.warning(t('logs.exportNoMatchesTruncated', { rows: rowCount }));
+        else toast.info(t('logs.exportNoMatches'));
+        return;
+      }
+      download(buildCsv(rows));
+      if (truncated) {
+        toast.warning(t(throttled ? 'logs.exportThrottled' : 'logs.exportTruncated', { rows: rowCount }));
+      }
+    } catch (err) {
+      toast.error(t('logs.exportFailed'), err instanceof Error ? err.message : undefined);
     } finally {
       setExporting(false);
     }
   };
-
-  if (loading && logs.length === 0) {
-    return (
-      <div
-        className="logs-page"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '400px' }}
-      >
-        <Loader2 className="animate-spin" size={32} />
-      </div>
-    );
-  }
 
   return (
     <div className="logs-page">
@@ -182,17 +190,24 @@ export function Logs() {
             <span>{t('logs.columns.ip')}</span>
             <span>{t('logs.columns.severity')}</span>
           </div>
-          {filteredLogs.length === 0 ? (
+          {/* The spinner stays inside the table: a search or severity change switches to a page that
+              may not be cached, and replacing the whole page would unmount the search box mid-typing. */}
+          {loading && logs.length === 0 ? (
+            <div className="empty-table-state">
+              <Loader2 className="animate-spin" size={32} />
+            </div>
+          ) : filteredLogs.length === 0 ? (
             <div className="empty-table-state">
               <FileText size={48} strokeWidth={1} />
-              {hasSeverityFilter || hasSearch ? (
+              {hasSeverityFilter && !hasSearch ? (
+                <>
+                  <h3>{t('logs.empty.title')}</h3>
+                  <p>{t('logs.empty.filteredServerDescription')}</p>
+                </>
+              ) : hasSearch ? (
                 <>
                   <h3>{t('logs.empty.filteredTitle')}</h3>
-                  <p>
-                    {hasSeverityFilter && !hasSearch
-                      ? t('logs.empty.filteredServerDescription')
-                      : t('logs.empty.filteredDescription')}
-                  </p>
+                  <p>{t('logs.empty.filteredDescription')}</p>
                 </>
               ) : (
                 <>
@@ -210,7 +225,7 @@ export function Logs() {
                 <span className="api-key">{log.apiKeyName || '—'}</span>
                 <span className="ip">{log.ipAddress || '—'}</span>
                 <span>
-                  <span className={`severity-badge ${log.severity}`}>{log.severity.toUpperCase()}</span>
+                  <span className={`severity-badge ${log.severity}`}>{t(`logs.severity.${log.severity}`)}</span>
                 </span>
               </div>
             ))

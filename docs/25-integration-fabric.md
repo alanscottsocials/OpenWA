@@ -27,19 +27,19 @@ public contract — Integration SDK v1** — because the contract, not any singl
 
 ## 25.2 Design principle: one new primitive, everything else a clone
 
-The overriding goal is to preserve the untrusted-worker safety invariants _by construction_. OpenWA
-plugins run in a capability-gated worker thread with no ambient host access (see
-[30 - Plugin Sandboxing](./30-plugin-sandboxing.md)). Every host↔worker message is a serializable POJO
-across a `structuredClone` boundary; host-initiated calls fail open on a timeout and drain on a worker
-crash; permissions are manifest-static and cannot be widened by configuration; session scope is enforced
-host-side.
+The overriding goal is to preserve the sandboxed-worker safety invariants _by construction_. OpenWA
+plugins reach the host through a capability-gated worker bridge; the worker is fault containment, not a
+security boundary against a malicious plugin (see [30 - Plugin Sandboxing](./30-plugin-sandboxing.md)).
+Every host↔worker message is a serializable POJO across a `structuredClone` boundary; host-initiated
+calls fail open on a timeout and drain on a worker crash; permissions are manifest-static and cannot be
+widened by configuration; session scope is enforced host-side.
 
 Rather than invent new machinery that would have to re-earn those properties, the Integration Fabric is
 **~90% a faithful clone of seams OpenWA already ships**:
 
 | Concern                                                   | Cloned from                         |
 | --------------------------------------------------------- | ----------------------------------- |
-| Host→worker dispatch with fail-open timeout + crash-drain | the existing hook bridge            |
+| Host→worker dispatch with a bounded timeout + crash-drain | the existing hook bridge            |
 | Worker→host capability calls                              | the existing capability router      |
 | Durable delivery with retry + dead-letter                 | the outbound webhook queue and DLQ  |
 | Identity mapping table (no foreign key, last-write-wins)  | the LID↔phone mapping table         |
@@ -49,9 +49,9 @@ Rather than invent new machinery that would have to re-earn those properties, th
 
 Exactly **one** genuinely new primitive exists: a host→worker RPC that returns an **HTTP status + body**
 from a sandboxed worker — inbound webhook ingress. It is modelled line-for-line on the hook bridge so its
-correctness properties (its own pending map, a fail-open timeout, and a drain in the worker-exit handler)
-come for free. If a worker crashes mid-request, the pending ingress call resolves to a `502` instead of
-hanging the HTTP request forever.
+correctness properties (its own pending map, a bounded timeout, and a drain in the worker-exit handler)
+come for free. A timeout resolves `504` and a mid-dispatch crash resolves `502`; the ingress job treats
+either as a failed delivery and retries or dead-letters it.
 
 ## 25.3 Architecture
 
@@ -94,14 +94,17 @@ Alongside this async pipeline, a route may additionally declare a `response` con
 
 - **Ingress RPC** — the one new primitive. Delivers a verified inbound request into the worker and returns
   its HTTP result. The worker claims routes with `ctx.registerWebhook(route, handler)`.
-- **Ingress controller** — a `@Public` endpoint (`POST|GET /api/ingress/:pluginId/:instanceId/:route`).
-  It is public to the API-key guard because an external provider cannot present the gateway's API key, so
-  it self-validates (see §25.6). It never runs the plugin inline — providers enforce short acknowledgement
+- **Ingress controller** — a `@Public` endpoint accepting any HTTP method on
+  `/api/ingress/:pluginId/:instanceId/:route` (a `GET` on a route that declares `challenge` is answered
+  host-side as the verification handshake; every other request is a delivery). It is public to the
+  API-key guard because an external provider cannot present the gateway's API key, so it self-validates
+  (see §25.6). It never runs the plugin inline — providers enforce short acknowledgement
   deadlines, so the controller fast-acks and defers the work to the queue. A route may additionally
   declare a host-side `response` contract that shapes that synchronous reply without making the plugin
   inline. Its `preflight` checks (today: `session-alive`) run **after** signature verification and
   **before** the dedup persist — returning `503` only for a definitively-dead concrete-scoped WhatsApp
-  session (no live engine or `FAILED`); recoverable statuses and `READY` pass through to a normal
+  session (no live engine or `FAILED`), with a `Retry-After` so a provider that retries a 503 only when
+  that header is present comes back; recoverable statuses and `READY` pass through to a normal
   `202`+enqueue so the worker can still fail fast and the dedup row still holds the delivery. A declared
   `ack` (`status`/`body`/`headers`) replaces the default `202 accepted`. For a route declaring `response`,
   the ack is returned without awaiting enqueue so a queue-disabled deployment cannot block the provider's
@@ -158,14 +161,21 @@ Four tables live on the data connection, each created by a hand-authored dual-di
 - **Authentication inversion.** A provider webhook cannot carry an OpenWA API key, so ingress is public to
   the API-key guard but validates a **per-instance HMAC (or shared secret)** over the **raw** request
   bytes with a constant-time comparison. The raw body is preserved by a verify callback on the body parser
-  because a re-serialized payload is not byte-identical to what the provider signed. The global rate-limit
-  guard still applies, and the payload is intentionally not bound to a DTO so strict validation cannot
-  reject unknown provider fields.
+  because a re-serialized payload is not byte-identical to what the provider signed. The route is exempt from
+  the global per-IP throttle and bounded on two keys instead: the client IP, checked by its own guard before
+  anything else, and `(pluginId, instanceId)`, charged only once the delivery's signature verifies. A
+  provider delivering every tenant's webhooks from one egress address would otherwise be shed at the global
+  tier before the per-instance bound ever fired. The payload is intentionally not bound to a DTO so strict
+  validation cannot reject unknown provider fields.
 - **Replay and duplication.** A signed-timestamp tolerance rejects stale deliveries, and
   `(pluginId, instanceId, providerDeliveryId)` deduplication plus a queue job id keyed on the delivery id
   provides best-effort de-duplication when the provider supplies a stable delivery id. Standard Webhooks defaults
   to its signed `webhook-id`; other handlers must remain idempotent because arbitrary provider headers
-  are not authenticated by every scheme. Freshness is enforced whenever a route declares
+  are not authenticated by every scheme. A route whose provider mints a fresh delivery id on every retry
+  attempt can declare `dedupOn: "body"` to key retries on the raw body instead: byte-identical bodies
+  then collapse within `INGRESS_DEDUP_RETENTION_DAYS`, the persisted delivery id and the `{id}` ack
+  token become that content hash, and a provider whose retries legitimately differ in the signed body
+  should keep the default, since `body` would dedup nothing for it. Freshness is enforced whenever a route declares
   `signature.timestampHeader`: the declared `toleranceSec` wins, and otherwise the host default
   (`INGRESS_TIMESTAMP_TOLERANCE_SEC`, default 300) applies — a declared timestamp is never accepted
   without a freshness check. Freshness alone is not replay protection, though: an **unsigned**
@@ -175,7 +185,15 @@ Four tables live on the data connection, each created by a hand-authored dual-di
   so the signature itself expires with the window; the loader warns when a route declares the header
   without signing it (or signs the token without declaring the header). `standard-webhooks` binds
   id + timestamp by spec. A provider that sends no timestamp header at all stays outside the replay
-  window by construction — dedup and handler idempotency are its only protections.
+  window by construction. For such an hmac-sha256 route, and for every `shared-secret` route, the default
+  header-keyed dedup does not stop a copy of a delivery: the dedup header is not covered by the
+  credential, so a copy with a different header value is accepted as new. `dedupOn: "body"` collapses
+  byte-identical copies within `INGRESS_DEDUP_RETENTION_DAYS` (a copy gets the route's ack and is not
+  enqueued again); beyond that, handler idempotency is the only protection. The loader logs a warning
+  for each such route that keeps the header-keyed default.
+  The value of a route's declared signature header (hmac-sha256 or shared-secret) is redacted from the
+  persisted and enqueued payload, like the well-known signature headers, so the plugin's handler sees
+  `[redacted]` in its place.
 - **Tenancy scoping.** Every durable ingress artifact — secret, dedup store, and dead-letter row — is
   partitioned by instance, and downstream capability calls carry the instance's resolved session scope, so
   a cross-tenant send is blocked host-side.
@@ -188,9 +206,11 @@ Four tables live on the data connection, each created by a hand-authored dual-di
   `ERROR`. When the operator has opted in, the loader still logs its boot warning for every such route.
 - **Raw-body content types.** Signature verification observes exact bytes for `application/json` and
   `application/x-www-form-urlencoded`. Plain text, XML, octet streams, and non-UTF JSON charsets are not
-  supported ingress body formats and fail verification/content handling rather than being re-serialized.
-- **Egress.** The only outbound path remains the existing SSRF-guarded `ctx.net.fetch`, scoped to the
-  manifest's allowed hosts.
+  supported ingress body formats and are refused with `415` on every signature scheme, before
+  verification or persistence, rather than being re-serialized.
+- **Egress.** The only sanctioned outbound path remains the SSRF-guarded `ctx.net.fetch`, scoped to the
+  manifest's allowed hosts; a direct Node socket opened by the worker is not covered (see [30 - Plugin
+  Sandboxing](./30-plugin-sandboxing.md)).
 - **Re-entrancy.** A reply issued _inside_ an ingress handler seeds the in-flight hook set, so an adapter's
   own outbound message hook cannot echo-loop the reply back out to the external system.
 
@@ -203,6 +223,12 @@ strict FIFO is not preserved across retry/redrive, and the lock is single-node s
 PostgreSQL state. When the queue is disabled, ingress dispatches inline after persisting and does not
 serialize concurrent same-conversation deliveries. Providers already deliver over unordered,
 at-least-once HTTP, so plugin handlers must be idempotent and treat ingress as a reconciliation trigger.
+
+A job waiting on that lock still holds one of the `INGRESS_WORKER_CONCURRENCY` worker slots (default
+10). A burst on one lane larger than that fills every slot with same-lane waiters, and events for other
+conversations and instances queue behind the burst until it drains. Size `INGRESS_WORKER_CONCURRENCY`
+above the largest burst you expect on a single lane, and declare a `conversationId` pointer on the
+route so the lane is one conversation; without it the lane is the whole instance.
 
 Persist-before-acknowledge alone is not delivery: a crash between the persist and the enqueue, or a
 fire-and-forget enqueue on a `response` route whose outcome is never recorded, would strand the row
@@ -221,7 +247,8 @@ bounded redrive path instead of an infinite replay loop; a successful replay lik
 row's payload with the `dispatched` mark and retires any live-path dead-letter row for the same
 delivery so a later redrive never double-delivers. A `pending` row found without a payload (only
 possible for imported/corrupt history — payloads are retired only with a recorded outcome) is
-skipped loudly, never replayed empty.
+excluded from the sweep and never replayed empty; nothing logs it, and it stays `pending` until
+`INGRESS_DEDUP_RETENTION_DAYS` prunes it.
 
 Table growth is bounded by construction rather than by operator hygiene: the per-instance ingress
 throttle caps the row-creation rate, dispatched rows slim to a marker + hash, and the two retention
@@ -232,13 +259,14 @@ dedup rows and re-admit their replays, which is worse than the bounded growth it
 
 ## 25.8 The Integration SDK (v1)
 
-The stable surface untrusted adapters consume. A plugin declares `sdkVersion: "1"` and an `ingress`
-descriptor (the route, its signature scheme, replay tolerance, dedup header, and an optional verification
-handshake) in its manifest, and requests the `webhook:ingress` and `conversation:send` permissions. The
-host refuses to load an ingress-declaring plugin whose declared **major** differs from the host's
-supported major, and the surface is **additive-only** within a major. The worker-facing API centres on
-`ctx.registerWebhook(...)` (claim an inbound route), `ctx.conversations.send(...)` (normalized reply), and
-per-instance mapping and handover helpers.
+The stable surface sandboxed adapters consume. A plugin declares `sdkVersion: "1"` and an `ingress`
+descriptor (the route, which is a single URL path segment such as `chatwoot` and never contains a `/`, its
+signature scheme, replay tolerance, dedup header, and an optional verification handshake) in its manifest,
+and requests the `webhook:ingress` and `conversation:send` permissions. The host refuses to load an
+ingress-declaring plugin whose declared **major** differs from the host's supported major, and the surface
+is **additive-only** within a major. The worker-facing API centres on `ctx.registerWebhook(...)` (claim an
+inbound route), `ctx.conversations.send(...)` (normalized reply), and per-instance mapping and handover
+helpers.
 
 The `signature.scheme` field enumerates `hmac-sha256` (HMAC over a `contentTemplate`), `shared-secret`
 (constant-time header compare), `standard-webhooks`, and `none` (unauthenticated — a route declaring it
@@ -262,7 +290,20 @@ Within major 1 the surface grows additively. A route's optional `response` contr
 `headers`, rendered host-side with `{rawBody}`/`{timestamp}`/`{id}` templates from the verified request),
 and an advisory `deadlineMs` — lets an adapter shape the synchronous HTTP response the provider sees; the
 plugin still always runs async, and a route with no `response` is byte-identical to today's default
-fast-ack. The `mode: 'sync-reply'` value is **deprecated** in favor of `response`: it was inert dead code
+fast-ack. `ack.body` and every `ack.headers` value must be strings, `ack.status` must be a final status
+(200-599), and a header value may hold no control character (other than HTAB) and nothing above U+00FF,
+since Node cannot write one; a manifest that declares otherwise is refused at install and at boot, which
+leaves that plugin in error until the manifest is fixed. A declared header is dropped rather than written
+when it is one of these thirteen names: `content-type`, which the host sets itself (a declared
+`application/json` or `text/plain` is honored as the bare media type with `charset=utf-8`, and any other
+declared type, or none, is sent as `text/plain`, so a reflected ack is never served as executable
+content); `content-length`, `transfer-encoding`, `content-encoding` and `trailer`, since the host frames
+the response itself and never compresses it; `set-cookie`, `access-control-allow-origin` and
+`access-control-allow-credentials`; and `content-security-policy`, `x-content-type-options`,
+`x-frame-options`, `strict-transport-security` and `referrer-policy`, the response protections the host
+sets for every request. Every other declared header goes out verbatim.
+
+The `mode: 'sync-reply'` value is **deprecated** in favor of `response`: it was inert dead code
 that was never wired to the HTTP response (the pipeline is always async + fast-ack), and it is kept in the
 `mode` union only to preserve SDK v1 additive-only compatibility — do not remove it within major 1, and do
 not rely on it at runtime.

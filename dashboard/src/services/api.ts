@@ -2,6 +2,8 @@
 // Centralized API client with TypeScript types
 
 import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
+import { isKeyUnusable } from '../utils/authLifecycle';
+import { fetchAllPages } from '../utils/fetchAllPages';
 
 // Resolve the API base URL. By default this is the same-origin relative path '/api',
 // correct when the dashboard and API are served from the same origin (the default
@@ -12,7 +14,7 @@ import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
 // same-origin '/api' and a split deployment failed with "Invalid API Key" (#91).
 // Exported so direct fetches (e.g. auth/validate in Login.tsx / App.tsx) honor VITE_API_URL
 // too — otherwise split-origin deployments break. Empty VITE_API_URL → '/api'.
-const API_ORIGIN = (import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '');
+export const API_ORIGIN = (import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '');
 export const API_BASE_URL = `${API_ORIGIN}/api`;
 // Warn (not refuse — would break dev + TLS-terminating-proxy) when the API origin is an
 // insecure http:// URL pointing at a non-localhost host (API keys sent in cleartext).
@@ -154,6 +156,26 @@ export interface Webhook {
   updatedAt: string;
 }
 
+// Request bodies for webhook writes. `secret` and `headers` are write-only: no webhook read returns them.
+export interface CreateWebhookRequest {
+  url: string;
+  events: string[];
+  filters?: WebhookFilters | null;
+  secret?: string;
+  headers?: Record<string, string>;
+}
+
+export interface UpdateWebhookRequest {
+  url?: string;
+  events?: string[];
+  active?: boolean;
+  filters?: WebhookFilters | null;
+  /** An empty string removes the stored secret. */
+  secret?: string;
+  /** Replaces the stored map wholesale; `{}` removes every custom header. */
+  headers?: Record<string, string>;
+}
+
 export interface MessageTemplate {
   id: string;
   sessionId: string;
@@ -179,6 +201,7 @@ export interface ApiKey {
   role: 'admin' | 'operator' | 'viewer';
   allowedIps?: string[];
   allowedSessions?: string[];
+  allowedChats?: string[];
   isActive: boolean;
   expiresAt?: string;
   lastUsedAt?: string;
@@ -295,6 +318,8 @@ export interface ChatMessage {
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
     call?: { video: boolean; missed: boolean };
+    /** Business prompt choices (Baileys). Present on inbound prompts that offer buttons. */
+    buttons?: Array<{ id: string; text: string }>;
   };
 }
 
@@ -323,8 +348,8 @@ export interface EngineHistoryMessage {
   isLidSender?: boolean;
   senderPhone?: string | null;
   /**
-   * Sender contact info, best-effort from the engine's cache. History carries `pushName` only;
-   * the richer fields arrive on `message.received` when `WEBHOOK_CONTACT_DETAILS=true`.
+   * Sender contact info, best-effort from the engine's cache. History carries `name` and `pushName`;
+   * the richer fields are added when `WEBHOOK_CONTACT_DETAILS=true`, as on `message.received`.
    */
   contact?: {
     id?: string;
@@ -534,6 +559,14 @@ export interface HealthStatus {
   };
 }
 
+/** GET /infra/update-check: the running version against the latest published release. */
+export interface UpdateCheck {
+  current: string;
+  latest: string | null;
+  updateAvailable: boolean;
+  releaseUrl: string | null;
+}
+
 export interface InfraStatus {
   // `builtIn` = OpenWA's own bundled container is actually running and backing this service (live),
   // not just the saved intent — falls back to the saved flag when Docker is unavailable. (#488)
@@ -547,8 +580,8 @@ export interface InfraStatus {
   engine: {
     type: string;
     headless: boolean;
-    // whatsapp-web.js only: the actual WhatsApp Web build in use (distinct from the library version)
-    // and how it was chosen. (#488)
+    // whatsapp-web.js only: the WhatsApp Web build sessions request as their pin (distinct from the
+    // library version, and not necessarily the build a page runs) and how it was chosen. (#488)
     webVersion?: string | null;
     webVersionSource?: 'pinned' | 'auto' | 'native';
   };
@@ -680,24 +713,24 @@ export interface SearchResults {
 // API Client
 // =============================================================================
 
-// Shared failure handling for every response shape (json/text/blob). On 401 the stored API key is
-// invalid/expired/revoked — clear it and return to login so the user isn't stuck on a dashboard that
-// 401s every request; the never-settling promise halts this request's chain so callers neither flash
-// a generic error toast nor receive an undefined payload while the page navigates away. Otherwise
-// throw an Error carrying the HTTP status and, when the gateway supplied one, its machine code.
+// Shared failure handling for every response shape (json/text/blob). When the stored API key is
+// unusable (a 401 for an invalid/expired/revoked key, or a 403 because its allowedIps refuse this
+// client) clear it and return to login so the user isn't stuck on a dashboard where every request
+// fails; the never-settling promise halts this request's chain so callers neither flash a generic
+// error toast nor receive an undefined payload while the page navigates away. Otherwise throw an
+// Error carrying the HTTP status and, when the gateway supplied one, its machine code.
 async function handleErrorResponse<T>(response: Response): Promise<T> {
-  if (response.status === 401) {
+  // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
+  // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
+  // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
+  const error = await response.json().catch(() => ({}));
+  if (isKeyUnusable(response.status, error.message)) {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
       window.location.assign('/');
       return new Promise<T>(() => {});
     }
   }
-
-  // On a non-JSON body (e.g. a reverse-proxy 502/503 HTML page) fall through to `HTTP <status>`
-  // rather than statusText: the status code is what the toast connection-lost de-dup matches on,
-  // and statusText is empty over HTTP/2 anyway.
-  const error = await response.json().catch(() => ({}));
   // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
   // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
   // Carry the machine `code` too: the gateway's stable codes (SESSION_LOGOUT_INCOMPLETE,
@@ -815,7 +848,7 @@ export const sessionApi = {
     }),
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
   getGroups: (id: string) =>
-    request<{ id: string; name: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
+    request<{ id: string; name?: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
   getChats: (id: string) => request<Chat[]>(`/sessions/${id}/chats`),
   markChatRead: (id: string, chatId: string) =>
     request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
@@ -881,12 +914,12 @@ export const sessionApi = {
 export const webhookApi = {
   listBySession: (sessionId: string) => request<Webhook[]>(`/sessions/${sessionId}/webhooks`),
   listAll: () => request<Webhook[]>('/webhooks'),
-  create: (sessionId: string, data: { url: string; events: string[]; filters?: WebhookFilters | null }) =>
+  create: (sessionId: string, data: CreateWebhookRequest) =>
     request<Webhook>(`/sessions/${sessionId}/webhooks`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  update: (sessionId: string, id: string, data: Partial<Webhook>) =>
+  update: (sessionId: string, id: string, data: UpdateWebhookRequest) =>
     request<Webhook>(`/sessions/${sessionId}/webhooks/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
@@ -936,7 +969,18 @@ export interface ProfilePictureResponse {
 }
 
 export const contactApi = {
-  list: (sessionId: string) => request<Contact[]>(`/sessions/${sessionId}/contacts`),
+  // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete.
+  list: async (sessionId: string) =>
+    (
+      await fetchAllPages(
+        async (limit, offset) => {
+          const data = await request<Contact[]>(`/sessions/${sessionId}/contacts?limit=${limit}&offset=${offset}`);
+          // The route answers a bare array with no total: a short page is the last one.
+          return { data, total: data.length < limit ? offset + data.length : Infinity };
+        },
+        { pageSize: 1000 },
+      )
+    ).items,
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
@@ -951,7 +995,7 @@ export const contactApi = {
       `/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/phone`,
     ),
   // Batch-resolve profile picture URLs for a whole sidebar in ONE request — the per-chat burst of
-  // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 3 at a time
+  // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 5 at a time
   // server-side; ids beyond the backend's 50-id cap are dropped client-side too.
   profilePictures: (sessionId: string, contactIds: string[]) =>
     request<{ pictures: Record<string, string | null> }>(
@@ -974,6 +1018,7 @@ export const apiKeyApi = {
     allowedIps?: string[];
     allowedSessions?: string[];
     expiresAt?: string;
+    allowedChats?: string[];
   }) =>
     request<CreatedApiKey>('/auth/api-keys', {
       method: 'POST',
@@ -986,7 +1031,9 @@ export const apiKeyApi = {
       role?: string;
       allowedIps?: string[];
       allowedSessions?: string[];
-      expiresAt?: string;
+      /** null removes the expiry. */
+      expiresAt?: string | null;
+      allowedChats?: string[];
     },
   ) =>
     request<ApiKey>(`/auth/api-keys/${id}`, {
@@ -1076,6 +1123,15 @@ export const messageApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  /**
+   * Tap a choice on an inbound business button/list prompt (Baileys only).
+   * `messageId` is the prompt's WhatsApp id; `buttonId` is `buttons[].id`.
+   */
+  clickButton: (sessionId: string, data: { chatId: string; messageId: string; buttonId: string; text?: string }) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/click-button`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   react: (sessionId: string, data: { chatId: string; messageId: string; emoji: string }) =>
     request<void>(`/sessions/${sessionId}/messages/react`, {
       method: 'POST',
@@ -1112,6 +1168,7 @@ export const healthApi = {
 
 export const infraApi = {
   getStatus: () => request<InfraStatus>('/infra/status'),
+  getUpdateCheck: () => request<UpdateCheck>('/infra/update-check'),
   getConfig: () => request<SavedConfig>('/infra/config'),
   saveConfig: (config: SaveConfigPayload) =>
     request<{ message: string; saved: boolean; envPath: string; profiles: string[] }>('/infra/config', {
@@ -1125,6 +1182,9 @@ export const infraApi = {
       profiles: string[];
       profilesToRemove: string[];
       estimatedTime: number;
+      // Present only when Docker started or stopped built-in services; `errors` lists what failed.
+      orchestration?: { errors?: string[] };
+      removal?: { errors?: string[] };
     }>('/infra/restart', {
       method: 'POST',
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
@@ -1354,7 +1414,8 @@ export interface CreateInstanceInput {
 
 export interface UpdateInstanceInput {
   enabled?: boolean;
-  sessionScope?: string;
+  /** null resets a scoped instance to all sessions; omit to leave the scope unchanged. */
+  sessionScope?: string | null;
   config?: Record<string, unknown>;
 }
 

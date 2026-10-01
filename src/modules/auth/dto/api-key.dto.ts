@@ -1,18 +1,10 @@
-import {
-  IsString,
-  IsOptional,
-  IsEnum,
-  IsArray,
-  ArrayUnique,
-  IsDateString,
-  MinLength,
-  MaxLength,
-  Validate,
-} from 'class-validator';
+import { IsString, IsOptional, IsEnum, IsArray, ArrayUnique, IsDateString, MinLength, Validate } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { MaxCodePoints } from '../../../common/validation/max-code-points';
 import { ApiKeyRole } from '../entities/api-key.entity';
 import { IsIpOrCidrConstraint } from './is-ip-or-cidr.validator';
 import { IsSessionIdConstraint } from './is-session-id.validator';
+import { IsChatIdConstraint } from './is-chat-id.validator';
 
 export class CreateApiKeyDto {
   @ApiProperty({
@@ -21,7 +13,7 @@ export class CreateApiKeyDto {
   })
   @IsString()
   @MinLength(3)
-  @MaxLength(100)
+  @MaxCodePoints(100)
   name!: string;
 
   @ApiPropertyOptional({
@@ -58,6 +50,21 @@ export class CreateApiKeyDto {
   allowedSessions?: string[];
 
   @ApiPropertyOptional({
+    description:
+      'Chat ids this key may read and send to — a curated allowlist independent of `allowedSessions`. ' +
+      'Entries are a group `<id>@g.us`, a contact `<phone>@c.us` / `<lid>@lid`, or a bare phone number. ' +
+      'A contact entry also matches its resolved `@lid` form (and vice versa) through the lid mapping ' +
+      'table. Omit or leave empty to let the key reach every chat.',
+    example: ['120363000000000000@g.us', '919999999999@c.us'],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @Validate(IsChatIdConstraint, { each: true })
+  allowedChats?: string[];
+
+  @ApiPropertyOptional({
     description: 'Expiration date (ISO 8601)',
     example: '2027-12-31T23:59:59Z',
   })
@@ -74,7 +81,7 @@ export class ApiKeyResponseDto {
   name!: string;
 
   @ApiProperty({
-    description: 'First 8 characters of the key (for identification)',
+    description: 'First 12 characters of the key (for identification)',
   })
   keyPrefix!: string;
 
@@ -86,6 +93,9 @@ export class ApiKeyResponseDto {
 
   @ApiPropertyOptional()
   allowedSessions?: string[];
+
+  @ApiPropertyOptional()
+  allowedChats?: string[];
 
   @ApiProperty()
   isActive!: boolean;
@@ -118,6 +128,12 @@ export class ValidateApiKeyResponseDto {
 
   @ApiPropertyOptional({ enum: ApiKeyRole, description: "The key's role; present only when valid." })
   role?: ApiKeyRole;
+
+  @ApiPropertyOptional({
+    description: 'Engine the process resolved at boot; present only when valid.',
+    example: 'baileys',
+  })
+  engineType?: string;
 }
 
 export class UpdateApiKeyDto {
@@ -125,7 +141,7 @@ export class UpdateApiKeyDto {
   @IsOptional()
   @IsString()
   @MinLength(3)
-  @MaxLength(100)
+  @MaxCodePoints(100)
   name?: string;
 
   @ApiPropertyOptional({ enum: ApiKeyRole })
@@ -150,6 +166,18 @@ export class UpdateApiKeyDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @Validate(IsChatIdConstraint, { each: true })
+  allowedChats?: string[];
+
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: 'Expiration date (ISO 8601); null clears it (an empty string is rejected)',
+  })
+  @IsOptional()
   @IsDateString()
-  expiresAt?: string;
+  expiresAt?: string | null;
 }

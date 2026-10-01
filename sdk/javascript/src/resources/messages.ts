@@ -13,6 +13,7 @@ import type {
   BatchStatusResponse,
   BulkMessageResponse,
   ChatHistoryMessage,
+  ClickButtonRequest,
   DeleteMessageRequest,
   EditMessageRequest,
   ForwardMessageRequest,
@@ -74,7 +75,10 @@ export class MessagesResource {
     return this.client.sendMedia(sessionId, 'send-audio', body);
   }
 
-  /** Send a document (url or base64; `filename` required). */
+  /**
+   * Send a document (url or base64). `filename` is optional and is the name the recipient sees;
+   * without it the gateway uses `"file"`, or the URL basename for a URL send on whatsapp-web.js.
+   */
   sendDocument(sessionId: string, body: SendMediaRequest): Promise<MessageResponse> {
     return this.client.sendMedia(sessionId, 'send-document', body);
   }
@@ -125,6 +129,18 @@ export class MessagesResource {
     return this.client.request<MessageResponse>({
       method: 'POST',
       path: `/api/sessions/${encodeSegment(sessionId)}/messages/reply`,
+      body,
+    });
+  }
+
+  /**
+   * Click a button on a WhatsApp Business prompt. Baileys only (whatsapp-web.js returns 501).
+   * Sends a structured reply proto quoted to the prompt, not a native UI tap.
+   */
+  clickButton(sessionId: string, body: ClickButtonRequest): Promise<MessageResponse> {
+    return this.client.request<MessageResponse>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/click-button`,
       body,
     });
   }

@@ -4,12 +4,14 @@ jest.mock('fs', () => ({ __esModule: true, ...jest.requireActual<typeof import('
 
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { UnauthorizedException, NotFoundException, ConflictException } from '@nestjs/common';
+import { Repository, type QueryDeepPartialEntity } from 'typeorm';
+import { UnauthorizedException, NotFoundException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { createHash, createHmac } from 'crypto';
 import * as fs from 'fs';
-import { AuthService, resolveSeedApiKey, bannerKeyLine } from './auth.service';
+import { AuthService, resolveSeedApiKey, bannerKeyLine, UnresolvedApiKeyException } from './auth.service';
 import { ApiKeyUsageTracker } from './api-key-usage-tracker.service';
+import { getRequestActor, runWithRequestId } from '../../common/services/request-context';
+import { ActiveKeyIndex } from './active-key-index';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 
 // Helpers
@@ -24,6 +26,7 @@ function createMockApiKey(overrides: Partial<ApiKey> = {}): ApiKey {
     role: ApiKeyRole.OPERATOR,
     allowedIps: null,
     allowedSessions: null,
+    allowedChats: null,
     isActive: true,
     expiresAt: null,
     lastUsedAt: null,
@@ -50,6 +53,18 @@ describe('resolveSeedApiKey (first-boot default admin key)', () => {
   it('uses API_MASTER_KEY verbatim when set', () => {
     process.env.API_MASTER_KEY = 'my-explicit-master-key';
     expect(resolveSeedApiKey()).toBe('my-explicit-master-key');
+  });
+
+  // validateApiKey hashes the trimmed key, so a seed hashed with a trailing newline (a Kubernetes secret
+  // made --from-file) could never authenticate, and the non-empty table meant it was never reseeded.
+  it('trims surrounding whitespace from API_MASTER_KEY so the seeded key can authenticate', () => {
+    process.env.API_MASTER_KEY = '  my-explicit-master-key\n';
+    expect(resolveSeedApiKey()).toBe('my-explicit-master-key');
+  });
+
+  it('treats a whitespace-only API_MASTER_KEY as unset and generates a key', () => {
+    process.env.API_MASTER_KEY = '   ';
+    expect(resolveSeedApiKey()).toMatch(/^owa_k1_[a-f0-9]{64}$/);
   });
 
   it('generates a random owa_k1_ key by default (no opt-in)', () => {
@@ -96,8 +111,12 @@ describe('AuthService', () => {
   /** Statements whose write committed (affected = 1), newest last, with whether the last-admin
    * guard clause was bound — for assertions on what actually landed, and how. */
   let committedWrites: Array<{ mode: 'update' | 'delete'; patch?: Record<string, unknown>; guarded: boolean }>;
+  /** The raw AND-fragment the last-admin guard binds, so the SQL predicate itself is asserted. */
+  let lastAdminFragments: string[];
+  let keyIndex: { refreshSoon: jest.Mock };
 
   beforeEach(async () => {
+    keyIndex = { refreshSoon: jest.fn() };
     repository = {
       count: jest.fn(),
       find: jest.fn(),
@@ -119,6 +138,7 @@ describe('AuthService', () => {
           provide: getRepositoryToken(ApiKey, 'main'),
           useValue: repository,
         },
+        { provide: ActiveKeyIndex, useValue: keyIndex },
       ],
     }).compile();
 
@@ -139,6 +159,7 @@ describe('AuthService', () => {
   function setupKeys(seed: ApiKey[]): void {
     keys = new Map(seed.map(k => [k.id, k]));
     committedWrites = [];
+    lastAdminFragments = [];
     (repository.findOne as jest.Mock).mockImplementation((options: { where: { id: string } }) =>
       Promise.resolve(keys.get(options.where.id) ?? null),
     );
@@ -175,8 +196,9 @@ describe('AuthService', () => {
           this.targetId = params.id;
           return this;
         },
-        andWhere() {
+        andWhere(fragment: string) {
           this.guarded = true;
+          lastAdminFragments.push(fragment);
           return this;
         },
         setParameters() {
@@ -188,7 +210,12 @@ describe('AuthService', () => {
           const guardPasses =
             !this.guarded ||
             !isUsableAdminRow(target) ||
-            [...keys.values()].some(k => k.id !== target.id && isUsableAdminRow(k));
+            [...keys.values()].some(
+              k =>
+                k.id !== target.id &&
+                isUsableAdminRow(k) &&
+                (!k.expiresAt || (!!target.expiresAt && k.expiresAt >= target.expiresAt)),
+            );
           if (!guardPasses) return Promise.resolve({ affected: 0 });
           if (this.mode === 'delete') keys.delete(this.targetId as string);
           else Object.assign(target, this.patch ?? {});
@@ -201,13 +228,14 @@ describe('AuthService', () => {
   }
 
   /** JS mirror of the guard's "usable admin" row predicate (the SQL definition lives in the
-   * service): an active, unexpired ADMIN key with no session scope. */
+   * service): an active, unexpired ADMIN key with no session OR chat scope. */
   function isUsableAdminRow(key: ApiKey): boolean {
     return (
       key.role === ApiKeyRole.ADMIN &&
       key.isActive &&
       (!key.expiresAt || key.expiresAt.getTime() > Date.now()) &&
-      (!key.allowedSessions || key.allowedSessions.length === 0)
+      (!key.allowedSessions || key.allowedSessions.length === 0) &&
+      (!key.allowedChats || key.allowedChats.length === 0)
     );
   }
 
@@ -397,6 +425,22 @@ describe('AuthService', () => {
     });
   });
 
+  describe('active key index', () => {
+    it('is refreshed after every key write', async () => {
+      (repository.create as jest.Mock).mockImplementation((dto: Partial<ApiKey>) => ({ ...dto, id: 'uuid-new' }));
+      await service.createApiKey({ name: 'new' });
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(1);
+
+      setupKeys([createMockApiKey({ id: 'uuid-1' }), createMockApiKey({ id: 'uuid-2' })]);
+      await service.update('uuid-1', { name: 'renamed' });
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(2);
+      await service.revoke('uuid-1');
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(3);
+      await service.delete('uuid-2');
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(4);
+    });
+  });
+
   describe('revoke', () => {
     it('should set isActive to false', async () => {
       setupKeys([createMockApiKey({ id: 'uuid-1', isActive: true })]);
@@ -563,6 +607,10 @@ describe('AuthService', () => {
     // admin must be rejected like a demotion — otherwise the system locks itself out for good.
     const unscopedAdmin = (id: string) => createMockApiKey({ id, role: ApiKeyRole.ADMIN });
     const scopedAdmin = (id: string) => createMockApiKey({ id, role: ApiKeyRole.ADMIN, allowedSessions: ['sess-1'] });
+    // A chat-scoped admin is likewise fenced out of key management (its routes are not
+    // @ChatScoped, so the guard refuses it), so it must not count as a usable admin either.
+    const chatScopedAdmin = (id: string) =>
+      createMockApiKey({ id, role: ApiKeyRole.ADMIN, allowedChats: ['123@g.us'] });
 
     it('rejects deleting the last unscoped admin even while a session-scoped admin survives', async () => {
       setupKeys([unscopedAdmin('admin-a'), scopedAdmin('admin-scoped')]);
@@ -602,6 +650,37 @@ describe('AuthService', () => {
 
       await expect(service.delete('admin-scoped')).resolves.toBeUndefined();
       await expect(service.findOne('admin-scoped')).rejects.toThrow(NotFoundException);
+      await expect(service.findOne('admin-a')).resolves.toBeDefined();
+    });
+
+    it('the guard SQL excludes a chat-scoped key (the predicate the database actually runs)', async () => {
+      // The isUsableAdminRow mirror above cannot prove the SQL: the string is never executed by the
+      // mock. Assert the AND-fragment the guard binds names allowedChats, so dropping the clause
+      // fails here rather than in production.
+      setupKeys([unscopedAdmin('admin-a'), chatScopedAdmin('admin-chat')]);
+
+      await expect(service.update('admin-a', { role: ApiKeyRole.OPERATOR })).rejects.toThrow(/last active admin/i);
+      expect(lastAdminFragments.join(' ')).toContain('allowedChats');
+    });
+
+    it('rejects deleting the last unscoped admin even while a chat-scoped admin survives', async () => {
+      setupKeys([unscopedAdmin('admin-a'), chatScopedAdmin('admin-chat')]);
+
+      await expect(service.delete('admin-a')).rejects.toThrow(/last active admin/i);
+      expect(repository.remove).not.toHaveBeenCalled();
+    });
+
+    it('rejects scoping the last unscoped admin to chats — the same capability-stripping', async () => {
+      setupKeys([unscopedAdmin('admin-a'), chatScopedAdmin('admin-chat')]);
+
+      await expect(service.update('admin-a', { allowedChats: ['123@g.us'] })).rejects.toThrow(/last active admin/i);
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
+    it('lets a chat-scoped admin be deleted — it never counted toward the invariant', async () => {
+      setupKeys([unscopedAdmin('admin-a'), chatScopedAdmin('admin-chat')]);
+
+      await expect(service.delete('admin-chat')).resolves.toBeUndefined();
       await expect(service.findOne('admin-a')).resolves.toBeDefined();
     });
 
@@ -654,6 +733,19 @@ describe('AuthService', () => {
       await expect(service.validateApiKey(` ${rawKey}\n`)).resolves.toMatchObject({ id: key.id });
     });
 
+    it('leaves the usage stats alone when the caller opts out of recording', async () => {
+      const rawKey = 'gate-key';
+      const key = createMockApiKey({ keyHash: hashKey(rawKey), lastUsedAt: new Date(Date.now() - 5 * 60_000) });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+
+      const result = await service.validateApiKey(rawKey, undefined, undefined, { recordUsage: false });
+
+      expect(result.id).toBe(key.id);
+      expect(result.usageCount).toBe(0);
+      expect(repository.update).not.toHaveBeenCalled();
+      expect(repository.increment).not.toHaveBeenCalled();
+    });
+
     it('coalesces the usage-stat write within the throttle window', async () => {
       const rawKey = 'recent-key';
       const key = createMockApiKey({ keyHash: hashKey(rawKey), lastUsedAt: new Date(), usageCount: 5 });
@@ -680,10 +772,14 @@ describe('AuthService', () => {
 
       // Scoped to the usage columns: persisting the whole entity here would write back the
       // authorisation state this request loaded, reverting any concurrent administrator change.
-      const [criteria, patch] = (repository.update as jest.Mock).mock.calls[0] as [{ id: string }, Partial<ApiKey>];
+      const [criteria, patch] = (repository.update as jest.Mock).mock.calls[0] as [
+        { id: string },
+        QueryDeepPartialEntity<ApiKey>,
+      ];
       expect(criteria).toEqual({ id: key.id });
       expect(Object.keys(patch).sort()).toEqual(['lastUsedAt', 'usageCount']);
-      expect(patch.usageCount).toBe(6);
+      // An increment by this request's delta, not the loaded value plus it.
+      expect((patch.usageCount as () => string)()).toBe('"usageCount" + 1');
       expect(repository.save).not.toHaveBeenCalled();
     });
 
@@ -700,6 +796,38 @@ describe('AuthService', () => {
       await expect(service.validateApiKey('revoked')).rejects.toThrow('API key is revoked');
     });
 
+    // Only a key that matches no row is marked unresolved, so its audit row may be sampled per IP; a
+    // rejection of a stored key must stay a plain 401 so every attempt is audited.
+    it('marks only an unknown key as unresolved, keeping the UnauthorizedException name', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(null);
+      const unknown = await service.validateApiKey('wrong-key').catch((err: unknown) => err);
+      expect(unknown).toBeInstanceOf(UnresolvedApiKeyException);
+      expect((unknown as Error).name).toBe('UnauthorizedException');
+
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockApiKey({ isActive: false }));
+      const revoked = await service.validateApiKey('revoked').catch((err: unknown) => err);
+      expect(revoked).toBeInstanceOf(UnauthorizedException);
+      expect(revoked).not.toBeInstanceOf(UnresolvedApiKeyException);
+    });
+
+    it.each([
+      ['revoked', { isActive: false }, undefined, undefined],
+      ['expired', { expiresAt: new Date(Date.now() - 60_000) }, undefined, undefined],
+      ['IP-refused', { allowedIps: ['10.0.0.1'] }, '192.168.1.1', undefined],
+      ['session-refused', { allowedSessions: ['session-A'] }, undefined, 'session-B'],
+    ])('stamps the request actor with a %s key before refusing it', async (_label, overrides, ip, session) => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockApiKey({ id: 'key-9', name: 'Leaked', ...overrides }),
+      );
+
+      const actor = await runWithRequestId('req-1', async () => {
+        await expect(service.validateApiKey('raw', ip, session)).rejects.toThrow();
+        return getRequestActor();
+      });
+
+      expect(actor).toMatchObject({ apiKeyId: 'key-9', apiKeyName: 'Leaked' });
+    });
+
     it('should throw UnauthorizedException for expired key', async () => {
       const expired = new Date();
       expired.setDate(expired.getDate() - 1);
@@ -709,14 +837,16 @@ describe('AuthService', () => {
       await expect(service.validateApiKey('expired')).rejects.toThrow('API key has expired');
     });
 
-    it('should throw UnauthorizedException when IP is not allowed', async () => {
+    it('answers 403, not 401, when the IP is not allowed', async () => {
       const key = createMockApiKey({
         allowedIps: ['10.0.0.1'],
         keyHash: hashKey('ip-restricted'),
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('ip-restricted', '192.168.1.1')).rejects.toThrow('IP address not allowed');
+      const err = await service.validateApiKey('ip-restricted', '192.168.1.1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('IP address not allowed');
     });
 
     it('should pass when client IP matches allowed IPs', async () => {
@@ -738,7 +868,9 @@ describe('AuthService', () => {
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('ip-no-client')).rejects.toThrow('Client IP could not be determined');
+      const err = await service.validateApiKey('ip-no-client').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('Client IP could not be determined');
     });
 
     it('rejects a malformed client IP instead of coercing it into an allowed range', async () => {
@@ -753,16 +885,24 @@ describe('AuthService', () => {
       await expect(service.validateApiKey('ip-malformed', '10.0.0.1abc')).rejects.toThrow('IP address not allowed');
     });
 
-    it('should throw UnauthorizedException when session not in allowedSessions', async () => {
+    it('answers 403, not 401, when the session is not in allowedSessions', async () => {
       const key = createMockApiKey({
         allowedSessions: ['session-A'],
         keyHash: hashKey('sess-restricted'),
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('sess-restricted', undefined, 'session-B')).rejects.toThrow(
-        'API key not authorized for this session',
-      );
+      const err = await service.validateApiKey('sess-restricted', undefined, 'session-B').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('API key not authorized for this session');
+    });
+
+    it('keeps 401 for a revoked or expired key', async () => {
+      for (const overrides of [{ isActive: false }, { expiresAt: new Date(Date.now() - 60_000) }]) {
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockApiKey(overrides));
+        const err = await service.validateApiKey('raw').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(UnauthorizedException);
+      }
     });
   });
 
@@ -787,8 +927,8 @@ describe('AuthService', () => {
       // Still due on the next request (DB lastUsedAt was never written) → the retry persists the
       // failed delta plus this request's increment — nothing is lost.
       await service.validateApiKey(rawKey);
-      const writes = (repository.update as jest.Mock).mock.calls as Array<[unknown, Partial<ApiKey>]>;
-      expect(writes[1][1].usageCount).toBe(7); // DB 5 + failed delta 1 + this request 1
+      const writes = (repository.update as jest.Mock).mock.calls as Array<[unknown, QueryDeepPartialEntity<ApiKey>]>;
+      expect((writes[1][1].usageCount as () => string)()).toBe('"usageCount" + 2'); // failed delta 1 + this request 1
 
       // The successful retry drained the accumulator — nothing left for the shutdown flush.
       await service.onModuleDestroy();

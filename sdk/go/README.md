@@ -4,11 +4,21 @@ Idiomatic Go client for the [OpenWA](https://github.com/rmyndharis/OpenWA) Whats
 API Gateway. Stdlib-only (no dependencies), context-first, with typed errors and
 an injectable transport pipeline.
 
+OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or
+Meta.
+
 ```bash
 go get github.com/rmyndharis/OpenWA/sdk/go
 ```
 
 Requires Go 1.22+.
+
+This README describes `main`. The v0.5.0 release lacks `Sessions.GetProxy`,
+`Sessions.UpdateProxy`, `Messages.ClickButton`, `VerifyWebhookSignature`, the
+`WebhookDelivery` type, the `ListSessionsQuery.Name` filter, the `APIError`
+fields `Code`, `RetryAfter` and `Header` and the refusal of empty and dot ids;
+they ship with the next SDK release. See
+[the SDK overview](../README.md#coverage).
 
 ## Quick start
 
@@ -29,11 +39,17 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if _, err := client.Sessions.Start(ctx, "my-session"); err != nil {
+	// Sessions are addressed by the UUID that Create returns, not by name. Create a
+	// session once; afterwards, find its ID with Sessions.List and a Name filter.
+	session, err := client.Sessions.Create(ctx, openwa.CreateSessionRequest{Name: "my-session"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := client.Sessions.Start(ctx, session.ID); err != nil {
 		log.Fatal(err)
 	}
 
-	res, err := client.Messages.SendText(ctx, "my-session", openwa.SendTextRequest{
+	res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
 		ChatID: "628123456789@c.us",
 		Text:   "Hello from the OpenWA Go SDK!",
 	})
@@ -80,7 +96,7 @@ func main() {
 ## Typed errors
 
 ```go
-res, err := client.Messages.SendText(ctx, "my-session", req)
+res, err := client.Messages.SendText(ctx, sessionID, req)
 switch {
 case errors.Is(err, openwa.ErrConflict):
 	// 409 — engine not ready; retry once the session is "ready".
@@ -94,18 +110,35 @@ case err != nil:
 }
 ```
 
-Sentinels: `ErrUnauthorized` (401), `ErrForbidden` (403), `ErrNotFound` (404),
-`ErrConflict` (409), `ErrRateLimited` (429), `ErrNotImplemented` (501),
-`ErrServiceUnavailable` (503 — the only retryable one). A timeout
-surfaces as `*openwa.TimeoutError`. In a routed deployment only 503 proves
-the request was never carried out: a forward that fails after the request
-reached the owner node answers 502 or 504.
+Sentinels: `ErrBadRequest` (400), `ErrUnauthorized` (401),
+`ErrForbidden` (403), `ErrNotFound` (404), `ErrConflict` (409),
+`ErrRateLimited` (429), `ErrNotImplemented` (501),
+`ErrServiceUnavailable` (503). 503 is transient, but a catalog 503 can persist
+because WhatsApp may never answer that query, so bound any retry. A 429 from
+the global rate limiter lifts when its window expires (seconds for the
+per-second tier, up to an hour for the hourly tier by default);
+`APIError.RetryAfter` carries its `Retry-After` header, which `WithRetry` also
+honors. A 429 whose `APIError.Code` is `"SEND_PACING_LIMITED"` is not transient:
+do not retry it before `RetryAfter`, which then comes from the body and can be
+hours. `APIError.Header` holds the response headers. A timeout surfaces as
+`*openwa.TimeoutError`. A 503 does not prove a write was never carried out: the
+engine answers it when WhatsApp did not confirm in time, and the change may still
+have been applied, so re-read the state before repeating it. In a routed
+deployment a forward that fails before reaching the owner node answers 503, one
+that fails after the request reached it answers 502 or 504, and a 503 from the
+owner itself is relayed unchanged.
 
 ## Retries
 
-Off by default. Opt in with a policy; only network errors and retryable statuses
-(429/5xx) are retried, with exponential backoff and `Retry-After` support.
-Request bodies are safely rewound on each attempt.
+Off by default. Opt in with a policy. Idempotent requests (GET, HEAD, OPTIONS,
+PUT, DELETE) are retried on network errors and on the policy's statuses (default
+429/500/502/503/504). A POST or PATCH (every send endpoint is a POST) is never
+retried after a network error and is retried only on 429 or 503 (when the policy
+lists them): a 500/502/504 can arrive after the message was already sent, so
+replaying it could send it twice. A 429 whose body has `code: "SEND_PACING_LIMITED"` is
+never retried, whatever the method: its delay is the body's `retryAfterSeconds`, which can be
+hours. Backoff is exponential, `Retry-After` is honored, and request bodies are safely rewound
+on each attempt.
 
 ```go
 client, _ := openwa.New(baseURL, apiKey,
@@ -155,6 +188,36 @@ var out map[string]any
 err := client.Do(ctx, "GET", "/api/some/new/path", nil, nil, &out)
 ```
 
+## Receiving webhooks
+
+A webhook configured with a secret signs each delivery in its
+`X-OpenWA-Signature` header. Check it with `VerifyWebhookSignature` against the
+raw request body, exactly as received, and decode the JSON only after the check
+passes: a re-serialized body can differ byte for byte and will not verify. The
+helper returns `false` for a missing, malformed or non-matching signature.
+`WebhookDelivery` types the decoded body.
+
+```go
+http.HandleFunc("/openwa/webhook", func(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !openwa.VerifyWebhookSignature(body, r.Header.Get("X-OpenWA-Signature"), secret) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	var delivery openwa.WebhookDelivery
+	if err := json.Unmarshal(body, &delivery); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	// Process delivery.Event and delivery.Data here.
+	w.WriteHeader(http.StatusOK)
+})
+```
+
 ## Security & reliability
 
 - **Use HTTPS in production.** The API key is sent as `X-API-Key` on every
@@ -164,6 +227,10 @@ err := client.Do(ctx, "GET", "/api/some/new/path", nil, nil, &out)
   than re-sending the API key to the redirect target.
 - Path segments (chat/message ids) are percent-encoded; a base-URL path prefix
   (e.g. behind a proxy at `/v1`) is preserved.
+- **Empty and dot ids are refused.** An empty, `.` or `..` id returns an error
+  and nothing is sent, so a proxy that resolves dot segments cannot turn the
+  call into one on the parent resource. `Client.Do` refuses a `.` or `..`
+  segment the same way but sends an empty one (a trailing slash) as written.
 
 ## Development
 

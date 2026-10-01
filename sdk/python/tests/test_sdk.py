@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 import httpx
 import pytest
 
@@ -44,6 +47,19 @@ class TestClientCore:
         assert backend.last_call.headers["content-type"] == "application/json"
         assert backend.last_call.headers["x-trace"] == "keep"  # benign custom headers still pass through
 
+    def test_default_headers_cannot_override_api_key_in_another_case(self):
+        # Header names are case-insensitive: a lowercase copy must be replaced, not sent alongside.
+        backend = MockBackend().on("GET", "/api/sessions", body=[])
+        client = OpenWAClient(
+            base_url="http://localhost",
+            api_key="REAL_KEY",
+            default_headers={"x-api-key": "EVIL", "content-type": "text/plain"},
+            transport=backend.as_transport(),
+        )
+        client.sessions.list()
+        assert backend.last_call.headers["x-api-key"] == "REAL_KEY"
+        assert backend.last_call.headers["content-type"] == "application/json"
+
     def test_non_json_2xx_body_returns_text(self):
         import httpx
 
@@ -61,6 +77,22 @@ class TestClientCore:
         backend2 = MockBackend().on("GET", "/history", body=[])
         make_client(backend2).messages.history("s", "a@c.us")
         assert "/messages/a@c.us/history" in backend2.last_call.url  # @ preserved
+
+    def test_empty_or_dot_ids_are_refused_before_sending(self):
+        # httpx resolves dot segments, so such an id would otherwise reach the
+        # parent resource.
+        backend = MockBackend()
+        client = make_client(backend)
+        with pytest.raises(ValueError):
+            client.webhooks.delete("s1", "..")
+        with pytest.raises(ValueError):
+            client.contacts.delete("s1", ".")
+        with pytest.raises(ValueError):
+            client.templates.delete("s1", "")
+        assert backend.calls == []
+        backend.on("DELETE", "/webhooks/", status=204)
+        client.webhooks.delete("s1", "628123@c.us")
+        assert backend.last_call.url == "http://localhost:2785/api/sessions/s1/webhooks/628123@c.us"
 
     def test_raw_request_escape_hatch(self):
         backend = MockBackend().on("GET", "/api/anything", body={"ok": True})
@@ -117,6 +149,11 @@ class TestClientCore:
         assert "sessionId" not in url
         assert "None" not in url
 
+    def test_raw_request_keeps_a_query_string_in_the_path(self):
+        backend = MockBackend().on("GET", "/api/sessions", body=[])
+        make_client(backend).request("GET", "/api/sessions?limit=5", query={"name": "x"})
+        assert backend.last_call.url == "http://localhost:2785/api/sessions?limit=5&name=x"
+
     def test_204_is_none(self):
         # `delete` is declared `-> None`, so asserting on its result is a type error and proves
         # nothing the signature does not already guarantee. What is worth asserting is that a 204
@@ -132,10 +169,54 @@ class TestClientCore:
         with pytest.raises(OpenWANotFoundError):
             make_client(backend).sessions.get("missing")
 
+    def test_error_exposes_code_retry_after_and_headers(self):
+        from email.utils import formatdate
+
+        from openwa.errors import OpenWARateLimitError
+
+        def fail(status: int, body: object = None, headers: dict[str, str] | None = None, text: str = "") -> OpenWAApiError:
+            content = json.dumps(body).encode() if body is not None else text.encode()
+            transport = httpx.MockTransport(lambda _: httpx.Response(status, content=content, headers=headers))
+            client = OpenWAClient(base_url="https://x", api_key="k", transport=transport)
+            with pytest.raises(OpenWAApiError) as caught:
+                client.sessions.list()
+            return caught.value
+
+        throttled = fail(429, {"statusCode": 429, "message": "ThrottlerException: Too Many Requests"}, {"Retry-After": "7"})
+        assert isinstance(throttled, OpenWARateLimitError)
+        assert throttled.retry_after_seconds == 7
+        assert throttled.code is None
+        assert throttled.headers is not None and throttled.headers["retry-after"] == "7"
+
+        # Send pacing puts its wait in the body; a header must not shorten it.
+        pacing = {
+            "statusCode": 429,
+            "error": "Too Many Requests",
+            "message": "Daily send cap reached",
+            "code": "SEND_PACING_LIMITED",
+            "retryAfterSeconds": 34521,
+        }
+        for headers in (None, {"Retry-After": "1"}):
+            err = fail(429, pacing, headers)
+            assert err.code == "SEND_PACING_LIMITED"
+            assert err.retry_after_seconds == 34521
+
+        dated = fail(503, headers={"Retry-After": formatdate(time.time() + 2, usegmt=True)})
+        assert dated.retry_after_seconds is not None and 0 <= dated.retry_after_seconds <= 3
+        assert fail(503, headers={"Retry-After": "soon"}).retry_after_seconds is None
+        # An out-of-range date overflows inside the stdlib parser; it is still just unparseable.
+        for huge in ("Mon, 01 Jan 99999999999999999999 00:00:00 GMT", "Fri, 1 Jan 2100 00:00:00 +99999999999999999999"):
+            assert fail(503, headers={"Retry-After": huge}).retry_after_seconds is None
+
+        logout = fail(502, {"statusCode": 502, "message": "x", "code": "SESSION_LOGOUT_INCOMPLETE"})
+        assert logout.code == "SESSION_LOGOUT_INCOMPLETE"
+        plain = fail(500, text="oops")
+        assert plain.code is None and plain.retry_after_seconds is None
+
     def test_maps_503_to_service_unavailable(self):
-        # The gateway answers 503 when the engine never confirmed an operation -- the one typed error
-        # here worth retrying. It used to fall through to the base class while the permanent 501 had a
-        # subclass of its own.
+        # The gateway answers 503 when the engine never confirmed an operation: a transport failure,
+        # which is worth retrying, as a 429 is. It used to fall through to the base class while the
+        # permanent 501 had a subclass of its own.
         backend = MockBackend()
         backend.on("GET", "/api/sessions/s1", 503, {
             "statusCode": 503, "message": "WhatsApp did not answer", "error": "Service Unavailable"
@@ -753,13 +834,15 @@ class TestChatsAndHealth:
         backend = MockBackend()
         backend.on("GET", "/api/health", body={"status": "ok", "version": "0.7.2"})
         backend.on("GET", "/live", body={"status": "ok"})
-        backend.on("GET", "/ready", body={"status": "ok", "details": {}})
+        # The full path, so it outranks the shorter /api/health prefix it contains.
+        ready = {"status": "ok", "details": {"mainDatabase": {"status": "up"}, "dataDatabase": {"status": "up"}}}
+        backend.on("GET", "/api/health/ready", body=ready)
         backend.on("POST", "/validate", body={"valid": True, "role": "admin"})
         client = make_client(backend)
         client.health.check()
         assert backend.calls[-1].url == "http://localhost:2785/api/health"
         client.health.live()
-        client.health.ready()
+        assert client.health.ready()["details"]["mainDatabase"]["status"] == "up"
         client.auth()
         assert backend.calls[-1].method == "POST"
         assert "/auth/validate" in backend.calls[-1].url

@@ -1,7 +1,8 @@
 # OpenWA SDKs
 
-Official client libraries for the [OpenWA](https://github.com/rmyndharis/OpenWA)
-WhatsApp API Gateway.
+Official client libraries for [OpenWA](https://github.com/rmyndharis/OpenWA), the
+open-source WhatsApp API Gateway. OpenWA is an independent project, not
+affiliated with or endorsed by WhatsApp or Meta.
 
 All five SDKs are **hand-written** against the exact API surface (paths, DTOs,
 response shapes) and **unit-tested with mocked HTTP transports** that assert on
@@ -25,7 +26,7 @@ All five SDKs expose the same fluent resource surface:
 | Resource    | Methods                                                                                                                                                                                                                                                                                    |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `sessions`  | list, get, getConfig, updateConfig, getProxy, updateProxy, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, setOnlinePresence, stats                                                                                                                         |
-| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch                                           |
+| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, clickButton, forward, react, delete, editMessage, history, reactions, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch                              |
 | `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                      |
 | `groups`    | list, get, create, joinGroup, joinInfo, add/remove/promote/demoteParticipants, setSubject, setDescription, get/updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests |
 | `webhooks`  | list, listAll, deliveryFailures, get, create, update, delete, test                                                                                                                                                                                                                         |
@@ -38,8 +39,29 @@ All five SDKs expose the same fluent resource surface:
 | `templates` | list, get, create, update, delete                                                                                                                                                                                                                                                          |
 | `profile`   | setProfileName, setProfileStatus, setProfilePicture, deleteProfilePicture _(OPERATOR)_                                                                                                                                                                                                     |
 | `calls`     | rejectCall, createLink _(OPERATOR)_                                                                                                                                                                                                                                                        |
-| `media`     | conversionStatus, convertVoice, convertVideo _(OPERATOR)_                                                                                                                                                                                                                                  |
+| `media`     | conversionStatus, convertVoice _(OPERATOR)_, convertVideo _(OPERATOR)_                                                                                                                                                                                                                     |
 | `health`    | check, live, ready                                                                                                                                                                                                                                                                         |
+
+The table describes `main`. The 0.5.0 registry builds do not include
+`sessions.getProxy`, `sessions.updateProxy` or `messages.clickButton`
+(`get_proxy`, `update_proxy` and `click_button` in Python; `GetProxy`,
+`UpdateProxy` and `ClickButton` in Go); they ship with the next SDK release.
+The webhook signature helpers (`verifyWebhookSignature`,
+`verify_webhook_signature`, `VerifyWebhookSignature`, `WebhookSignature.verify`,
+`WebhookSignature::verify`), the `WebhookDelivery` types and the API error code,
+retry-delay and headers accessors are not in 0.5.0 either; they also ship with
+the next SDK release.
+Nor is the Java fallback to `UNKNOWN`: 0.5.0 decodes a response enum value it
+does not recognise to `null` (`MessageType` and `ChatKind` included), and
+`SessionStatus`, `DeliveryStatus` and the other response enums that lack an
+`unknown` wire value have no `UNKNOWN` constant there.
+The refusal of an empty, `.` or `..` id (and, in the JavaScript, Go and Java
+raw-request methods, of a `.` or `..` path segment) and the PHP
+`sessions->create()` fix that sends an empty `config` as `{}` are not in 0.5.0
+either; they ship with the next SDK release.
+Nor is the `name` filter on `sessions.list` (`ListSessionsQuery.Name` in Go,
+the `name` field of `ListSessionsQuery` in Java, JavaScript and Python); it
+ships with the next SDK release.
 
 > ⚠️ Endpoints requiring an `OPERATOR`-level API key are noted in the inline
 > docs. Deliberately **not** exposed, matching `docs/18-sdk-design.md` exactly:
@@ -61,6 +83,11 @@ All five SDKs expose the same fluent resource surface:
 > documented by hand in `docs/06-api-specification.md`, and the docs-contract
 > gate names `POST /mcp` as the one heading allowed outside the contract.
 
+Every example below addresses a session by its id: the UUID that
+`sessions.create()` returns, not the name passed to it. Create a session once (a
+second `create` with the same name answers `409`); afterwards, find its id with
+`sessions.list` filtered by `name`.
+
 ## JavaScript / TypeScript
 
 ```bash
@@ -75,8 +102,11 @@ const client = new OpenWAClient({
   apiKey: 'owa_k1_…',
 });
 
-await client.sessions.start('my-session');
-const result = await client.messages.sendText('my-session', {
+const session = await client.sessions.create({ name: 'my-session' });
+await client.sessions.start(session.id);
+// Link the account before sending: scan sessions.getQrCode or use sessions.requestPairingCode,
+// then wait for status 'ready'. An unlinked session answers the send with 409.
+const result = await client.messages.sendText(session.id, {
   chatId: '628123456789@c.us',
   text: 'Hello from the OpenWA SDK!',
 });
@@ -113,8 +143,11 @@ client = OpenWAClient(
     api_key="owa_k1_…",
 )
 
-client.sessions.start("my-session")
-result = client.messages.send_text("my-session", {
+session = client.sessions.create({"name": "my-session"})
+client.sessions.start(session["id"])
+# Link the account before sending: scan sessions.get_qr_code or use sessions.request_pairing_code,
+# then wait for status "ready". An unlinked session answers the send with 409.
+result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
     "text": "Hello from the OpenWA Python SDK!",
 })
@@ -139,8 +172,11 @@ $client = new Client([
     'apiKey'  => 'owa_k1_…',
 ]);
 
-$client->sessions->start('my-session');
-$result = $client->messages->sendText('my-session', [
+$session = $client->sessions->create(['name' => 'my-session']);
+$client->sessions->start($session['id']);
+// Link the account before sending: scan sessions->getQrCode or use sessions->requestPairingCode,
+// then wait for status 'ready'. An unlinked session answers the send with 409.
+$result = $client->messages->sendText($session['id'], [
     'chatId' => '628123456789@c.us',
     'text'   => 'Hello from the OpenWA PHP SDK!',
 ]);
@@ -162,13 +198,18 @@ handler is a `MockHandler` — no global state, no network.
 
 ```java
 import com.rmyndharis.openwa.OpenWAClient;
+import com.rmyndharis.openwa.model.CreateSessionRequest;
 import com.rmyndharis.openwa.model.MessageResponse;
 import com.rmyndharis.openwa.model.SendTextRequest;
+import com.rmyndharis.openwa.model.SessionResponse;
 
 OpenWAClient client = new OpenWAClient("http://localhost:2785", "owa_k1_…");
 
-client.sessions.start("my-session");
-MessageResponse result = client.messages.sendText("my-session",
+SessionResponse session = client.sessions.create(CreateSessionRequest.builder().name("my-session").build());
+client.sessions.start(session.id());
+// Link the account before sending: scan sessions.getQrCode or use sessions.requestPairingCode,
+// then wait for status READY. An unlinked session answers the send with 409.
+MessageResponse result = client.messages.sendText(session.id(),
     SendTextRequest.builder()
         .chatId("628123456789@c.us")
         .text("Hello from the OpenWA Java SDK!")
@@ -202,11 +243,22 @@ if err != nil {
 }
 
 ctx := context.Background()
-client.Sessions.Start(ctx, "my-session")
-res, err := client.Messages.SendText(ctx, "my-session", openwa.SendTextRequest{
+session, err := client.Sessions.Create(ctx, openwa.CreateSessionRequest{Name: "my-session"})
+if err != nil {
+    log.Fatal(err)
+}
+if _, err := client.Sessions.Start(ctx, session.ID); err != nil {
+    log.Fatal(err)
+}
+// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+// then wait for status "ready". An unlinked session answers the send with 409.
+res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
     ChatID: "628123456789@c.us",
     Text:   "Hello from the OpenWA Go SDK!",
 })
+if err != nil {
+    log.Fatal(err)
+}
 fmt.Println(res.MessageID)
 ```
 
@@ -225,8 +277,17 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   for `429`). The injectable transport (`fetch` / `transport` / `httpClient`) is
   the extension point for retry or observability middleware. The Go client is
   the exception: it ships an opt-in policy (`WithRetry(DefaultRetryPolicy())`)
-  that handles `429`/`5xx`, honors `Retry-After`, and rewinds request bodies —
+  that retries idempotent requests on network errors and `429`/`5xx`, retries a
+  `POST`/`PATCH` only on `429`/`503` (never after a network error), never
+  retries a send-pacing `429` (`code: "SEND_PACING_LIMITED"`), honors
+  `Retry-After`, and rewinds request bodies —
   still off unless you ask for it.
+- **Webhook signatures.** Every SDK verifies a delivery's `X-OpenWA-Signature`
+  against the raw request body: `verifyWebhookSignature` (JavaScript),
+  `verify_webhook_signature` (Python), `VerifyWebhookSignature` (Go),
+  `WebhookSignature.verify` (Java) and `WebhookSignature::verify` (PHP). The
+  JavaScript, Python, Go and Java SDKs also type the delivery body as
+  `WebhookDelivery`.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.
 - **Default per-request timeout** is 30s (configurable). Path segments (chat /

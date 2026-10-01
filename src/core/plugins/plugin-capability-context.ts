@@ -268,8 +268,9 @@ export class PluginCapabilityContext {
         this.resolveEngineRead(plugin, sessionId).getChatHistory(
           chatId,
           // Clamp to the REST non-deep ceiling (MessageService.MAX_CHAT_HISTORY_LIMIT = 100) so an
-          // untrusted plugin can't request an unbounded history fetch.
-          Math.min(Math.max(Math.trunc(limit ?? 50), 1), 100),
+          // untrusted plugin can't request an unbounded history fetch. A non-finite limit (a sandboxed
+          // caller's arg is unvalidated) takes the default: NaN would reach the engine as "no limit".
+          Math.min(Math.max(typeof limit === 'number' && Number.isFinite(limit) ? Math.trunc(limit) : 50, 1), 100),
           includeMedia ?? false,
         ),
       canonicalChatId: (sessionId, chatId) => {
@@ -441,6 +442,13 @@ export class PluginCapabilityContext {
         // it reuses CONVERSATION_SEND rather than adding a new permission.
         this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
         this.assertSessionActive(plugin, key.sessionId);
+        // The sandbox router checks this too; an in-process plain-JS plugin reaches here unchecked,
+        // and any other value would be stored and silently never hold the chat.
+        if (state !== 'bot' && state !== 'human' && state !== 'closed') {
+          throw new PluginCapabilityError(
+            `Plugin ${plugin.manifest.id}: handover state must be 'bot', 'human' or 'closed'`,
+          );
+        }
         const mapping = await this.hostServices.getConversationMappingPort().get({
           sessionId: key.sessionId,
           chatId: key.chatId,

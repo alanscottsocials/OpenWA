@@ -21,6 +21,7 @@
  * Run locally: `npm run check:chart`. Runs in CI (Helm chart and workflows job). Needs Docker.
  */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // Pinned in step with the `helm lint` / `helm template` steps of .github/workflows/ci.yml. A version
@@ -31,6 +32,14 @@ const CHARTS = fileURLToPath(new URL('../charts', import.meta.url));
 const render = (...setArgs) =>
   execFileSync('docker', ['run', '--rm', '-v', `${CHARTS}:/charts:ro`, HELM_IMAGE, 'template', 'ci', '/charts/openwa', ...setArgs], {
     encoding: 'utf8',
+    maxBuffer: 1 << 24,
+  });
+
+/** Render with `valuesYaml` as a values file (`-f -`), which parses numbers unlike `--set`. */
+const renderValues = valuesYaml =>
+  execFileSync('docker', ['run', '-i', '--rm', '-v', `${CHARTS}:/charts:ro`, HELM_IMAGE, 'template', 'ci', '/charts/openwa', '-f', '-'], {
+    encoding: 'utf8',
+    input: valuesYaml,
     maxBuffer: 1 << 24,
   });
 
@@ -124,9 +133,10 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   );
 }
 
-// Boot is long and varies with the number of sessions to restore. That belongs to a startupProbe: it
-// suspends the liveness probe until it succeeds, so the boot window and the running-health window can
-// be set independently. Without one, the liveness budget alone decides how long boot may take.
+// Boot is long (migrations, the database connect retry, plugin load, backfills). That belongs to a
+// startupProbe: it suspends the liveness probe until it succeeds, so the boot window and the
+// running-health window can be set independently. Without one, the liveness budget alone
+// decides how long boot may take.
 {
   const sts = byKind(render(), 'StatefulSet')[0] ?? '';
   const startup = mapAt(sts, ['startupProbe']);
@@ -139,6 +149,62 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
     !startup
       ? `${nameOf(sts) ?? 'StatefulSet'}: no startupProbe, so boot must finish inside the ${livenessBudget}s liveness budget or the kubelet restarts the pod mid-boot`
       : `startupProbe allows ${startupBudget}s, liveness allows ${livenessBudget}s`,
+  );
+}
+
+// A probe that times out counts as a failure. The kubelet default is 1s, which /ready misses by
+// design (it bounds each database probe at READINESS_PROBE_TIMEOUT_MS so it can answer its own 503)
+// and which a CPU-throttled pod can miss even on the static /live route. The constant is read from
+// the controller so the two cannot drift; a rename fails here rather than skipping the check.
+{
+  const source = readFileSync(new URL('../src/modules/health/health.controller.ts', import.meta.url), 'utf8');
+  const match = /READINESS_PROBE_TIMEOUT_MS\s*=\s*([\d_]+)/.exec(source);
+  const handlerMs = match ? Number(match[1].replace(/_/g, '')) : NaN;
+  const sts = byKind(render(), 'StatefulSet')[0] ?? '';
+  const timeout = name => Number(mapAt(sts, [name])?.timeoutSeconds ?? 1);
+  const readiness = timeout('readinessProbe');
+  const short = ['livenessProbe', 'startupProbe'].filter(name => timeout(name) < 2);
+  check(
+    'probe-timeouts-cover-handlers',
+    Number.isFinite(handlerMs) && readiness * 1000 > handlerMs && short.length === 0,
+    !Number.isFinite(handlerMs)
+      ? 'READINESS_PROBE_TIMEOUT_MS not found in src/modules/health/health.controller.ts'
+      : readiness * 1000 <= handlerMs
+        ? `readinessProbe times out at ${readiness}s, not above the ${handlerMs}ms the handler may take`
+        : short.length
+          ? `${short.join(' and ')} time out below 2s`
+          : `readiness ${readiness}s exceeds the ${handlerMs}ms handler bound; liveness and startup allow ${timeout('livenessProbe')}s and ${timeout('startupProbe')}s`,
+  );
+}
+
+// The image also starts as a non-root uid, which is the only way to meet Pod Security "restricted".
+// That needs a pod-level securityContext (fsGroup is what makes a fresh volume writable by the uid)
+// and a way to drop the capability list the root entrypoint needs, while the default stays as it is.
+// The profile rendered is the one values.yaml documents, so the comment cannot drift from what works.
+{
+  const podContext = out => {
+    const sts = byKind(out, 'StatefulSet')[0] ?? '';
+    return /^ {6}securityContext:\n((?: {8}.*\n)+)/m.exec(sts)?.[1] ?? '';
+  };
+  const addsCaps = out => /^ {14}add:/m.test(byKind(out, 'StatefulSet')[0] ?? '');
+  const byDefault = render();
+  const values = readFileSync(`${CHARTS}/openwa/values.yaml`, 'utf8');
+  const profile = /^# {3}podSecurityContext:\n(?:# {3}.*\n)+/m.exec(values)?.[0] ?? '';
+  const nonRoot = renderValues(profile.replace(/^# {3}/gm, ''));
+  const pod = podContext(nonRoot);
+  const problems = [
+    podContext(byDefault) && 'the default render sets a pod securityContext',
+    !addsCaps(byDefault) && 'the default render lost the capabilities the root entrypoint needs',
+    !/runAsNonRoot: true/.test(pod) && 'podSecurityContext.runAsNonRoot does not reach the pod spec',
+    !/fsGroup: 997/.test(pod) && 'podSecurityContext.fsGroup does not reach the pod spec',
+    // Without it the kubelet re-owns every file on the volume on every mount before the pod starts.
+    !/fsGroupChangePolicy: OnRootMismatch/.test(pod) && 'podSecurityContext.fsGroupChangePolicy is not OnRootMismatch',
+    addsCaps(nonRoot) && 'containerSecurityContext.capabilities.add: null still renders an add list',
+  ].filter(Boolean);
+  check(
+    'non-root-profile-renders',
+    problems.length === 0,
+    problems.length ? problems.join('; ') : 'the default is unchanged, and podSecurityContext plus add: null render a non-root pod',
   );
 }
 
@@ -163,6 +229,34 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
     Object.keys(selector).length === 0
       ? `${nameOf(monitor) ?? 'ServiceMonitor'}: empty selector — it would match every Service in the namespace`
       : `${matched.length} Service(s) match the selector on port '${port}': ${matched.join(', ') || '(none)'}`,
+  );
+}
+
+// A values file is parsed as YAML, so an unquoted number reaches the templates as a float64, and
+// `quote` prints one of a million or more in exponent form. The app then reads "5.24288e+07" for a
+// byte limit (and refuses to boot) or "1.2345678e+07" for a password. `--set` parses integers as
+// int64, so the renders above never see it. Fractions and booleans must still pass through as written.
+{
+  const out = renderValues(
+    'env:\n  MEDIA_DOWNLOAD_MAX_BYTES: 52428800\n  CHECK_RATIO: 1.5\n  CHECK_FLAG: true\n' +
+      'secretEnv:\n  DATABASE_PASSWORD: 12345678\n',
+  );
+  const data = mapAt(byKind(out, 'ConfigMap')[0] ?? '', ['data']) ?? {};
+  const secret = mapAt(byKind(out, 'Secret')[0] ?? '', ['stringData']) ?? {};
+  const got = {
+    MEDIA_DOWNLOAD_MAX_BYTES: data.MEDIA_DOWNLOAD_MAX_BYTES,
+    CHECK_RATIO: data.CHECK_RATIO,
+    CHECK_FLAG: data.CHECK_FLAG,
+    DATABASE_PASSWORD: secret.DATABASE_PASSWORD,
+  };
+  const want = { MEDIA_DOWNLOAD_MAX_BYTES: '52428800', CHECK_RATIO: '1.5', CHECK_FLAG: 'true', DATABASE_PASSWORD: '12345678' };
+  const wrong = Object.keys(want).filter(k => got[k] !== want[k]);
+  check(
+    'values-file-numbers-render-as-written',
+    wrong.length === 0,
+    wrong.length
+      ? `values-file entries rendered differently from how they were written: ${wrong.map(k => `${k}=${JSON.stringify(got[k])}`).join(', ')}`
+      : 'unquoted numbers in a values file reach the ConfigMap and Secret as written',
   );
 }
 

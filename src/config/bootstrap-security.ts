@@ -136,6 +136,15 @@ export function isApiKeyPepperMissingInProduction(nodeEnv?: string, apiKeyPepper
 }
 
 /**
+ * Whether to warn that the main (auth/audit) DB schema is also managed by synchronize in production.
+ * After the migrations-main chain, synchronize alters api_keys/audit_logs to this release's entities
+ * without recording those changes in the migration ledger. Advisory only: the explicit opt-in keeps working.
+ */
+export function isMainDbSynchronizeInProduction(nodeEnv?: string, mainDbSynchronize?: string): boolean {
+  return nodeEnv === 'production' && mainDbSynchronize === 'true';
+}
+
+/**
  * Whether NODE_ENV is unset or blank. That is the deliberate local-dev default, but it silently
  * degrades four controls to their dev posture: the default-secret assert is skipped, a wildcard
  * CORS origin is allowed, Swagger UI is served, and validation error detail is exposed. Boot warns
@@ -208,7 +217,8 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   const isWeak = (value?: string): boolean => !value || FORBIDDEN_PROD_SECRETS.has(value.trim().toLowerCase());
   const problems: string[] = [];
 
-  // Built-in datastores run on the internal-only Docker network (not published), so their fixed
+  // Built-in datastores run on the internal-only Docker network (the managed container specs in
+  // docker.service.ts publish no host ports), so their fixed
   // 'openwa'/'minioadmin' credentials are not internet-reachable — exempt them so selecting the
   // built-in option doesn't crash-loop a production boot. The exemption requires BOTH the built-in
   // flag AND an internal host: a host-pinned EXTERNAL datastore (even with the built-in flag set) is
@@ -220,8 +230,10 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   }
   const s3Exempt = env.minioBuiltIn === 'true' && isInternalS3Endpoint(env.s3Endpoint);
   if (env.storageType === 's3' && !s3Exempt) {
-    if (isWeak(env.s3AccessKey)) problems.push('S3_ACCESS_KEY');
-    if (isWeak(env.s3SecretKey)) problems.push('S3_SECRET_KEY');
+    // Name the canonical variables even when the value came from the legacy S3_ACCESS_KEY /
+    // S3_SECRET_KEY fallback: they are what the docs and .env.example tell an operator to set.
+    if (isWeak(env.s3AccessKey)) problems.push('S3_ACCESS_KEY_ID');
+    if (isWeak(env.s3SecretKey)) problems.push('S3_SECRET_ACCESS_KEY');
   }
   // API_MASTER_KEY is optional, but if provided it must neither be a known default nor fall below
   // the length floor — both are refused the same way, like the other weak secrets above. Unset stays
